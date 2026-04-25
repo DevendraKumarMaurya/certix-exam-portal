@@ -1,0 +1,156 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function getUserRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+    
+    function isAdmin() {
+      return isAuthenticated() && getUserRole() == 'admin';
+    }
+    
+    function isExaminer() {
+      return isAuthenticated() && getUserRole() == 'examiner';
+    }
+    
+    function isStudent() {
+      return isAuthenticated() && getUserRole() == 'student';
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function examExists(examId) {
+      return exists(/databases/$(database)/documents/exams/$(examId));
+    }
+
+    function isAssignedToExam(examId, userId) {
+      return examExists(examId) && userId in get(/databases/$(database)/documents/exams/$(examId)).data.assignedTo;
+    }
+
+    // Login index: enrollment number -> auth email mapping
+    match /loginIndex/{loginId} {
+      // Required for pre-login enrollment lookup
+      allow read: if true;
+
+      // Only admins can manage index entries
+      allow create, update, delete: if isAdmin();
+    }
+    
+    // Users collection
+    match /users/{userId} {
+      // Users can read their own data (no role check to avoid circular dependency)
+      // Admins and examiners can read other users
+      allow read: if isAuthenticated() && (
+        isOwner(userId) || 
+        isAdmin() || 
+        isExaminer()
+      );
+      
+      // Only the user or admin can update their profile
+      allow update: if isOwner(userId) || isAdmin();
+      
+      // Only admins can create user profiles (admin-controlled provisioning)
+      allow create: if isAdmin();
+      
+      // Only admins can delete users (soft delete recommended)
+      allow delete: if isAdmin();
+    }
+    
+    // Questions collection
+    match /questions/{questionId} {
+      // Examiners/admins can read all questions.
+      // Students can read questions during exam rendering in current architecture.
+      allow read: if isAuthenticated() && (isAdmin() || isExaminer() || isStudent());
+      
+      // Only examiners and admins can create questions
+      allow create: if isAuthenticated() && (isExaminer() || isAdmin());
+      
+      // Only the creator or admin can update/delete
+      allow update, delete: if isAuthenticated() && 
+        (isAdmin() || (isExaminer() && resource.data.createdBy == request.auth.uid));
+    }
+    
+    // Exams collection
+    match /exams/{examId} {
+      // Examiners can read their own exams
+      // Admins can read all exams
+      // Students can read exams assigned to them
+      allow read: if isAuthenticated() && 
+        (isAdmin() || 
+         (isExaminer() && resource.data.createdBy == request.auth.uid) ||
+         (isStudent() && request.auth.uid in resource.data.assignedTo) ||
+         request.auth.uid in resource.data.assignedTo);
+      
+      // Only examiners and admins can create exams
+      allow create: if isAuthenticated() && (isExaminer() || isAdmin());
+      
+      // Only the creator or admin can update/delete
+      allow update, delete: if isAuthenticated() && 
+        (isAdmin() || (isExaminer() && resource.data.createdBy == request.auth.uid));
+    }
+    
+    // Exam Attempts collection
+    match /examAttempts/{attemptId} {
+      // Students can read their own attempts
+      // Examiners can read attempts for their exams
+      // Admins can read all attempts
+      allow read: if isAuthenticated() && 
+        (isAdmin() ||
+         (isStudent() && resource.data.studentId == request.auth.uid) ||
+         (isExaminer() && get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.createdBy == request.auth.uid));
+      
+      // Students can create their own attempts
+      allow create: if isAuthenticated() &&
+        request.resource.data.studentId == request.auth.uid &&
+        request.resource.data.examId is string &&
+        isAssignedToExam(request.resource.data.examId, request.auth.uid);
+      
+      // Students can update their own ongoing attempts (for auto-save)
+      // Examiners can update attempts for evaluation
+      allow update: if isAuthenticated() && 
+        ((isStudent() && resource.data.studentId == request.auth.uid && resource.data.status == 'ongoing') ||
+         (isExaminer() && get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.createdBy == request.auth.uid) ||
+         isAdmin());
+      
+      // Only admins can delete attempts
+      allow delete: if isAdmin();
+    }
+    
+    // Results collection
+    match /results/{resultId} {
+      // Students can read their own results
+      // Examiners can read results for their exams
+      // Admins can read all results
+      allow read: if isAuthenticated() && 
+        (isAdmin() ||
+         (isStudent() && resource.data.studentId == request.auth.uid && (resource.data.isPublished == true || resource.data.publishedAt != null)) ||
+         (isExaminer() && get(/databases/$(database)/documents/exams/$(resource.data.examId)).data.createdBy == request.auth.uid));
+      
+      // Only examiners and admins can create/update results
+      allow create, update: if isAuthenticated() && 
+        (isAdmin() || 
+         (isExaminer() && get(/databases/$(database)/documents/exams/$(request.resource.data.examId)).data.createdBy == request.auth.uid));
+      
+      // Only admins can delete results
+      allow delete: if isAdmin();
+    }
+    
+    // Settings collection
+    match /settings/{settingId} {
+      // All authenticated users can read settings
+      allow read: if isAuthenticated();
+      
+      // Only admins can create/update/delete settings
+      allow create, update, delete: if isAdmin();
+    }
+  }
+}
